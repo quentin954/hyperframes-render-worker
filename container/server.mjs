@@ -14,7 +14,7 @@ const RENDER_TIMEOUT_MS = 10 * 60 * 1000;
 const KILL_GRACE_MS = 5_000;
 const HYPERFRAMES_BIN = resolve("node_modules/.bin/hyperframes");
 
-function readBody(req, max = 200 * 1024 * 1024) {
+function readBody(req, max = 2 * 1024 * 1024 * 1024) {
   return new Promise((resolveBody, reject) => {
     const chunks = [];
     let total = 0;
@@ -56,7 +56,7 @@ function writeFiles(workdir, files) {
 
 function runRender(compDir, outFile) {
   return new Promise((resolveRun, reject) => {
-    const child = spawn(HYPERFRAMES_BIN, ["render", compDir, "-o", outFile, "--workers", "auto"], {
+    const child = spawn(HYPERFRAMES_BIN, ["render", compDir, "-o", outFile, "--fps", "60", "--workers", "auto"], {
       stdio: ["ignore", "pipe", "pipe"],
     });
 
