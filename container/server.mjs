@@ -3,6 +3,7 @@
 // GET  /jobs/:id → 200 json{ job }
 // GET  /jobs/:id/output → 200 video/mp4
 // DELETE /jobs/:id → 200 json{ deleted } | 202 json{ deleting }
+// GET  /queue → 200 json{ running, queued, jobs }
 // GET  /healthz → 200 "ok"
 
 import { createServer } from "node:http";
@@ -291,6 +292,19 @@ async function handleCreateJob(req, res) {
   json(res, 202, publicJob(job));
 }
 
+function queueSnapshot() {
+  const listed = [];
+  const runningJob = running === null ? null : jobs.get(running);
+  if (runningJob) {
+    listed.push({ jobId: runningJob.jobId, status: runningJob.status, workers: runningJob.workers ?? null });
+  }
+  pending.forEach((jobId, i) => {
+    const job = jobs.get(jobId);
+    if (job) listed.push({ jobId, status: job.status, workers: job.workers ?? null, position: i + 1 });
+  });
+  return { running: runningJob ? 1 : 0, queued: pending.length, jobs: listed };
+}
+
 function json(res, status, payload) {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(payload));
@@ -303,6 +317,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && path === "/healthz") {
       res.writeHead(200, { "content-type": "text/plain" });
       res.end("ok");
+      return;
+    }
+    if (req.method === "GET" && path === "/queue") {
+      json(res, 200, queueSnapshot());
       return;
     }
     if (req.method === "POST" && path === "/jobs") {
