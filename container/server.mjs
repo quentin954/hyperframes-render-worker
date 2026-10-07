@@ -1,4 +1,5 @@
 // HTTP render job API.
+// GET  /jobs → 200 json{ count, jobs }
 // POST /jobs  { files: [{ path, content: base64 }], workers? } → 202 json{ job }
 // GET  /jobs/:id → 200 json{ job }
 // GET  /jobs/:id/output → 200 video/mp4
@@ -292,6 +293,24 @@ async function handleCreateJob(req, res) {
   json(res, 202, publicJob(job));
 }
 
+function jobListing(job) {
+  const entry = {
+    jobId: job.jobId,
+    status: job.status,
+    createdAt: job.createdAt,
+    finishedAt: job.finishedAt ?? null,
+    size: job.size ?? null,
+  };
+  if (job.status === "complete") entry.download = `/jobs/${job.jobId}/output`;
+  return entry;
+}
+
+function jobList() {
+  return [...jobs.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map(jobListing);
+}
+
 function queueSnapshot() {
   const listed = [];
   const runningJob = running === null ? null : jobs.get(running);
@@ -322,6 +341,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && path === "/queue") {
       json(res, 200, queueSnapshot());
       return;
+    }
+    if (req.method === "GET" && path === "/jobs") {
+      const listed = jobList();
+      return json(res, 200, { count: listed.length, jobs: listed });
     }
     if (req.method === "POST" && path === "/jobs") {
       await handleCreateJob(req, res);
