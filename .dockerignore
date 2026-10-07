@@ -1,11 +1,9 @@
-node_modules
-.wrangler
+# The image only needs container/package.json and container/server.mjs.
 .git
-src
-public
-docs
-README.md
+**/node_modules
+data
+cloudflare-intro
+scripts
 *.md
-.dev.vars*
 .env*
-worker-configuration.d.ts
+.DS_Store
