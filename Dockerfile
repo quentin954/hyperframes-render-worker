@@ -52,5 +52,11 @@ RUN npx --no-install hyperframes browser ensure
 COPY container/server.mjs ./server.mjs
 
 ENV PORT=8080
+ENV DATA_DIR=/data
+
+# Mount a volume here so job.json, project/ and output.mp4 survive a container
+# rebuild: -v /opt/hyperframes/data:/data
+RUN mkdir -p /data/jobs
+
 EXPOSE 8080
 CMD ["node", "server.mjs"]

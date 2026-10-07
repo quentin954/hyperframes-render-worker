@@ -4,13 +4,13 @@
 // GET  /healthz → 200 "ok"
 
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve, sep } from "node:path";
-import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT ?? 8080);
+const DATA_DIR = process.env.DATA_DIR ?? "/data";
 const RENDER_TIMEOUT_MS = 10 * 60 * 1000;
 const KILL_GRACE_MS = 5_000;
 const HYPERFRAMES_BIN = resolve("node_modules/.bin/hyperframes");
@@ -60,6 +60,57 @@ function writeFiles(workdir, files) {
       await writeFile(abs, Buffer.from(f.content, "base64"));
     }),
   );
+}
+
+function jobDir(jobId) {
+  return join(DATA_DIR, "jobs", jobId);
+}
+
+async function writeJobFile(job) {
+  const target = join(jobDir(job.jobId), "job.json");
+  const tmp = `${target}.tmp`;
+  const { compDir, outFile, workRoot, child, ...record } = job;
+  await writeFile(tmp, JSON.stringify(record, null, 2));
+  await rename(tmp, target);
+}
+
+function rehydrate(job) {
+  return {
+    ...job,
+    compDir: join(jobDir(job.jobId), "project"),
+    outFile: join(jobDir(job.jobId), "output.mp4"),
+  };
+}
+
+async function recoverJobs() {
+  let entries;
+  try {
+    entries = await readdir(join(DATA_DIR, "jobs"), { withFileTypes: true });
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+    await mkdir(join(DATA_DIR, "jobs"), { recursive: true });
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    let job;
+    try {
+      job = JSON.parse(await readFile(join(DATA_DIR, "jobs", entry.name, "job.json"), "utf8"));
+    } catch {
+      continue;
+    }
+    if (TERMINAL.has(job.status)) {
+      jobs.set(job.jobId, rehydrate(job));
+      continue;
+    }
+    job.status = "failed";
+    job.error = "interrupted by a server restart";
+    job.finishedAt = Date.now();
+    const revived = rehydrate(job);
+    jobs.set(job.jobId, revived);
+    await writeJobFile(revived);
+  }
 }
 
 function resolveWorkers(value) {
@@ -132,6 +183,7 @@ async function execute(job) {
   running = job.jobId;
   job.status = "rendering";
   job.startedAt = Date.now();
+  await writeJobFile(job);
   try {
     await runRender(job, (child) => {
       job.child = child;
@@ -147,6 +199,7 @@ async function execute(job) {
   } finally {
     job.child = null;
     job.finishedAt = Date.now();
+    await writeJobFile(job).catch((err) => console.error(`[job ${job.jobId}] persist failed`, err));
     running = null;
     pump();
   }
@@ -169,12 +222,16 @@ async function handleCreateJob(req, res) {
   }
 
   const jobId = randomUUID();
-  const workRoot = await mkdtemp(join(tmpdir(), "render-"));
-  const compDir = join(workRoot, "composition");
-  await mkdir(compDir, { recursive: true });
-  await writeFiles(compDir, body.files);
+  const compDir = join(jobDir(jobId), "project");
+  try {
+    await mkdir(compDir, { recursive: true });
+    await writeFiles(compDir, body.files);
+  } catch (err) {
+    await rm(jobDir(jobId), { recursive: true, force: true }).catch(() => {});
+    throw err;
+  }
 
-  const job = {
+  const job = rehydrate({
     jobId,
     status: "queued",
     workers: resolveWorkers(body.workers),
@@ -183,10 +240,9 @@ async function handleCreateJob(req, res) {
     finishedAt: null,
     size: null,
     error: null,
-    workRoot,
-    compDir,
-    outFile: join(workRoot, "out.mp4"),
-  };
+    child: null,
+  });
+  await writeJobFile(job);
   jobs.set(jobId, job);
   pending.push(jobId);
   pump();
@@ -229,6 +285,7 @@ const server = createServer(async (req, res) => {
   res.end("not found");
 });
 
+await recoverJobs();
 server.listen(PORT, () => {
-  console.log(`[render-server] listening on :${PORT}`);
+  console.log(`[render-server] listening on :${PORT} data=${join(DATA_DIR, "jobs")}`);
 });
