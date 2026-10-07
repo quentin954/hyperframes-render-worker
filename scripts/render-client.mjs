@@ -6,7 +6,7 @@ import { argv, env } from "node:process";
 
 export function connection(extra = []) {
   const host = extra[0] ?? env.HF_TEST_HOST ?? "localhost";
-  const raw = extra[1] ?? env.HF_TEST_PORT ?? "18080";
+  const raw = extra[1] ?? env.HF_TEST_PORT ?? "11111";
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`invalid port "${raw}" — expected a number between 1 and 65535`);
