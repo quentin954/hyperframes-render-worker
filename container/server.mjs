@@ -1,18 +1,26 @@
-// HTTP server inside the Cloudflare Container.
-// POST /render { files: [{ path, content: base64 }] } → 200 video/mp4 | 500 json{error}
+// HTTP render job API.
+// POST /jobs  { files: [{ path, content: base64 }], workers? } → 202 json{ job }
+// GET  /jobs/:id → 200 json{ job }
 // GET  /healthz → 200 "ok"
 
 import { createServer } from "node:http";
-import { createReadStream } from "node:fs";
-import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const RENDER_TIMEOUT_MS = 10 * 60 * 1000;
 const KILL_GRACE_MS = 5_000;
 const HYPERFRAMES_BIN = resolve("node_modules/.bin/hyperframes");
+const FPS = 60;
+const ABSOLUTE_MAX_WORKERS = 24;
+const TERMINAL = new Set(["complete", "failed", "cancelled"]);
+
+const jobs = new Map();
+const pending = [];
+let running = null;
 
 function readBody(req, max = 2 * 1024 * 1024 * 1024) {
   return new Promise((resolveBody, reject) => {
@@ -54,11 +62,39 @@ function writeFiles(workdir, files) {
   );
 }
 
-function runRender(compDir, outFile) {
+function resolveWorkers(value) {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 1) return null;
+  return Math.min(n, ABSOLUTE_MAX_WORKERS);
+}
+
+function positionOf(jobId) {
+  const idx = pending.indexOf(jobId);
+  return idx === -1 ? null : idx + 1;
+}
+
+function publicJob(job) {
+  const view = {
+    jobId: job.jobId,
+    status: job.status,
+    workers: job.workers ?? null,
+    createdAt: job.createdAt,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+    elapsedMs: job.startedAt ? (job.finishedAt ?? Date.now()) - job.startedAt : 0,
+    size: job.size ?? null,
+    error: job.error ?? null,
+  };
+  const pos = positionOf(job.jobId);
+  if (pos !== null) view.position = pos;
+  return view;
+}
+
+function runRender(job, onSpawn) {
+  const args = ["render", job.compDir, "-o", job.outFile, "--fps", String(FPS), "--workers", job.workers ?? "auto"];
   return new Promise((resolveRun, reject) => {
-    const child = spawn(HYPERFRAMES_BIN, ["render", compDir, "-o", outFile, "--fps", "60", "--workers", "auto"], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = spawn(HYPERFRAMES_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
+    onSpawn(child);
 
     const stderrChunks = [];
     child.stdout.on("data", (d) => process.stdout.write(d));
@@ -92,54 +128,103 @@ function runRender(compDir, outFile) {
   });
 }
 
-async function handleRender(req, res) {
-  const t0 = Date.now();
-  const workRoot = await mkdtemp(join(tmpdir(), "render-"));
-  const compDir = join(workRoot, "composition");
-  const outFile = join(workRoot, "out.mp4");
-  await mkdir(compDir, { recursive: true });
-
+async function execute(job) {
+  running = job.jobId;
+  job.status = "rendering";
+  job.startedAt = Date.now();
   try {
-    const raw = await readBody(req);
-    const body = JSON.parse(raw.toString("utf8"));
-    if (!Array.isArray(body?.files) || body.files.length === 0) {
-      throw new Error("body.files must be a non-empty array");
-    }
-    await writeFiles(compDir, body.files);
-
-    await runRender(compDir, outFile);
-    const { size } = await stat(outFile);
-
-    res.writeHead(200, {
-      "content-type": "video/mp4",
-      "content-length": size,
-      "x-render-duration-ms": String(Date.now() - t0),
+    await runRender(job, (child) => {
+      job.child = child;
     });
-    createReadStream(outFile)
-      .on("error", (err) => res.destroy(err))
-      .pipe(res)
-      .on("close", () => {
-        rm(workRoot, { recursive: true, force: true }).catch(() => {});
-      });
+    job.size = (await stat(job.outFile)).size;
+    job.status = "complete";
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    console.error("[render] failed", message);
-    res.writeHead(500, { "content-type": "application/json" });
-    res.end(JSON.stringify({ error: message }));
-    rm(workRoot, { recursive: true, force: true }).catch(() => {});
+    if (job.status !== "cancelled") {
+      job.error = err instanceof Error ? err.message : String(err);
+      job.status = "failed";
+      console.error(`[job ${job.jobId}] failed\n${job.error}`);
+    }
+  } finally {
+    job.child = null;
+    job.finishedAt = Date.now();
+    running = null;
+    pump();
   }
 }
 
+function pump() {
+  if (running !== null) return;
+  const jobId = pending.shift();
+  if (jobId === undefined) return;
+  const job = jobs.get(jobId);
+  if (job && !TERMINAL.has(job.status)) void execute(job);
+  else pump();
+}
+
+async function handleCreateJob(req, res) {
+  const raw = await readBody(req);
+  const body = JSON.parse(raw.toString("utf8"));
+  if (!Array.isArray(body?.files) || body.files.length === 0) {
+    throw new Error("body.files must be a non-empty array");
+  }
+
+  const jobId = randomUUID();
+  const workRoot = await mkdtemp(join(tmpdir(), "render-"));
+  const compDir = join(workRoot, "composition");
+  await mkdir(compDir, { recursive: true });
+  await writeFiles(compDir, body.files);
+
+  const job = {
+    jobId,
+    status: "queued",
+    workers: resolveWorkers(body.workers),
+    createdAt: Date.now(),
+    startedAt: null,
+    finishedAt: null,
+    size: null,
+    error: null,
+    workRoot,
+    compDir,
+    outFile: join(workRoot, "out.mp4"),
+  };
+  jobs.set(jobId, job);
+  pending.push(jobId);
+  pump();
+
+  json(res, 202, publicJob(job));
+}
+
+function json(res, status, payload) {
+  res.writeHead(status, { "content-type": "application/json" });
+  res.end(JSON.stringify(payload));
+}
+
 const server = createServer(async (req, res) => {
-  if (req.method === "GET" && req.url === "/healthz") {
-    res.writeHead(200, { "content-type": "text/plain" });
-    res.end("ok");
-    return;
+  const path = new URL(req.url, "http://localhost").pathname;
+
+  try {
+    if (req.method === "GET" && path === "/healthz") {
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("ok");
+      return;
+    }
+    if (req.method === "POST" && path === "/jobs") {
+      await handleCreateJob(req, res);
+      return;
+    }
+    const jobMatch = /^\/jobs\/([^/]+)$/.exec(path);
+    if (jobMatch && req.method === "GET") {
+      const job = jobs.get(jobMatch[1]);
+      if (!job) return json(res, 404, { error: "unknown job" });
+      return json(res, 200, publicJob(job));
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("[request] failed", message);
+    if (res.headersSent) return res.destroy();
+    return json(res, 400, { error: message });
   }
-  if (req.method === "POST" && req.url === "/render") {
-    await handleRender(req, res);
-    return;
-  }
+
   res.writeHead(404, { "content-type": "text/plain" });
   res.end("not found");
 });
