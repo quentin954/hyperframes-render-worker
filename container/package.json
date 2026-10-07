@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "dependencies": {
+    "@hyperframes/producer": "0.8.137",
     "ffmpeg-static": "^5.2.0",
     "hyperframes": "0.8.137"
   }

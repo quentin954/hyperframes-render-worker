@@ -8,16 +8,16 @@
 import { createServer } from "node:http";
 import { createReadStream } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { spawn } from "node:child_process";
 import { dirname, join, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
+import { createRenderJob, executeRenderJob } from "@hyperframes/producer";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const DATA_DIR = process.env.DATA_DIR ?? "/data";
-const RENDER_TIMEOUT_MS = 10 * 60 * 1000;
-const KILL_GRACE_MS = 5_000;
-const HYPERFRAMES_BIN = resolve("node_modules/.bin/hyperframes");
 const FPS = 60;
+const QUALITY = process.env.RENDER_QUALITY ?? "standard";
+const ENTRY_FILE = process.env.ENTRY_FILE ?? "index.html";
+const RENDER_TIMEOUT_MS = Number(process.env.RENDER_TIMEOUT_MS ?? 0);
 const ABSOLUTE_MAX_WORKERS = 24;
 const TERMINAL = new Set(["complete", "failed", "cancelled"]);
 
@@ -72,7 +72,7 @@ function jobDir(jobId) {
 async function writeJobFile(job) {
   const target = join(jobDir(job.jobId), "job.json");
   const tmp = `${target}.tmp`;
-  const { compDir, outFile, workRoot, child, ...record } = job;
+  const { compDir, outFile, controller, ...record } = job;
   await writeFile(tmp, JSON.stringify(record, null, 2));
   await rename(tmp, target);
 }
@@ -136,6 +136,10 @@ function publicJob(job) {
     startedAt: job.startedAt,
     finishedAt: job.finishedAt,
     elapsedMs: job.startedAt ? (job.finishedAt ?? Date.now()) - job.startedAt : 0,
+    progress: job.progress ?? 0,
+    stage: job.stage ?? null,
+    totalFrames: job.totalFrames ?? null,
+    capturedFrames: job.capturedFrames ?? null,
     size: job.size ?? null,
     error: job.error ?? null,
   };
@@ -145,55 +149,41 @@ function publicJob(job) {
   return view;
 }
 
-function runRender(job, onSpawn) {
-  const args = ["render", job.compDir, "-o", job.outFile, "--fps", String(FPS), "--workers", job.workers ?? "auto"];
-  return new Promise((resolveRun, reject) => {
-    const child = spawn(HYPERFRAMES_BIN, args, { stdio: ["ignore", "pipe", "pipe"] });
-    onSpawn(child);
-
-    const stderrChunks = [];
-    child.stdout.on("data", (d) => process.stdout.write(d));
-    child.stderr.on("data", (d) => {
-      stderrChunks.push(d);
-      process.stderr.write(d);
-    });
-
-    let killTimer = null;
-    const timeoutTimer = setTimeout(() => {
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
-      reject(new Error(`render timed out after ${RENDER_TIMEOUT_MS}ms`));
-    }, RENDER_TIMEOUT_MS);
-
-    child.on("error", (err) => {
-      clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
-      reject(err);
-    });
-
-    child.on("close", (code) => {
-      clearTimeout(timeoutTimer);
-      if (killTimer) clearTimeout(killTimer);
-      if (code === 0) resolveRun();
-      else
-        reject(
-          new Error(`hyperframes render exited ${code}\n${Buffer.concat(stderrChunks).toString()}`),
-        );
-    });
+async function runRender(job) {
+  const request = createRenderJob({
+    fps: FPS,
+    quality: QUALITY,
+    entryFile: ENTRY_FILE,
+    workers: job.workers ?? undefined,
   });
+
+  const timer =
+    RENDER_TIMEOUT_MS > 0 ? setTimeout(() => job.controller.abort(), RENDER_TIMEOUT_MS) : null;
+
+  try {
+    await executeRenderJob(request, job.compDir, job.outFile, (current) => {
+      job.status = current.status;
+      job.progress = current.progress;
+      if (!TERMINAL.has(current.status)) job.stage = current.currentStage;
+      job.totalFrames = current.totalFrames ?? null;
+      job.capturedFrames = current.framesRendered ?? null;
+    }, job.controller.signal);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 async function execute(job) {
   running = job.jobId;
   job.status = "rendering";
   job.startedAt = Date.now();
+  job.controller = new AbortController();
   await writeJobFile(job);
   try {
-    await runRender(job, (child) => {
-      job.child = child;
-    });
+    await runRender(job);
     job.size = (await stat(job.outFile)).size;
     job.status = "complete";
+    job.progress = 100;
   } catch (err) {
     if (job.status !== "cancelled") {
       job.error = err instanceof Error ? err.message : String(err);
@@ -201,7 +191,7 @@ async function execute(job) {
       console.error(`[job ${job.jobId}] failed\n${job.error}`);
     }
   } finally {
-    job.child = null;
+    job.controller = null;
     job.finishedAt = Date.now();
     await writeJobFile(job).catch((err) => console.error(`[job ${job.jobId}] persist failed`, err));
     running = null;
@@ -217,10 +207,7 @@ async function handleDeleteJob(job, res) {
     job.status = "cancelled";
     job.error = "cancelled by client";
     job.finishedAt = Date.now();
-    if (job.child) {
-      job.child.kill("SIGTERM");
-      setTimeout(() => job.child?.kill("SIGKILL"), KILL_GRACE_MS).unref();
-    }
+    job.controller?.abort();
     await writeJobFile(job).catch(() => {});
   }
 
@@ -288,9 +275,13 @@ async function handleCreateJob(req, res) {
     createdAt: Date.now(),
     startedAt: null,
     finishedAt: null,
+    progress: 0,
+    stage: null,
+    totalFrames: null,
+    capturedFrames: null,
     size: null,
     error: null,
-    child: null,
+    controller: null,
   });
   await writeJobFile(job);
   jobs.set(jobId, job);
