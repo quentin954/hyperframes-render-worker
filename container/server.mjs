@@ -1,9 +1,12 @@
 // HTTP render job API.
 // POST /jobs  { files: [{ path, content: base64 }], workers? } → 202 json{ job }
 // GET  /jobs/:id → 200 json{ job }
+// GET  /jobs/:id/output → 200 video/mp4
+// DELETE /jobs/:id → 200 json{ deleted } | 202 json{ deleting }
 // GET  /healthz → 200 "ok"
 
 import { createServer } from "node:http";
+import { createReadStream } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve, sep } from "node:path";
@@ -138,6 +141,7 @@ function publicJob(job) {
   };
   const pos = positionOf(job.jobId);
   if (pos !== null) view.position = pos;
+  if (job.status === "complete") view.download = `/jobs/${job.jobId}/output`;
   return view;
 }
 
@@ -203,6 +207,52 @@ async function execute(job) {
     running = null;
     pump();
   }
+}
+
+async function handleDeleteJob(job, res) {
+  const idx = pending.indexOf(job.jobId);
+  if (idx !== -1) pending.splice(idx, 1);
+
+  if (!TERMINAL.has(job.status)) {
+    job.status = "cancelled";
+    job.error = "cancelled by client";
+    job.finishedAt = Date.now();
+    if (job.child) {
+      job.child.kill("SIGTERM");
+      setTimeout(() => job.child?.kill("SIGKILL"), KILL_GRACE_MS).unref();
+    }
+    await writeJobFile(job).catch(() => {});
+  }
+
+  jobs.delete(job.jobId);
+  purgeJobDir(job.jobId, res);
+}
+
+function purgeJobDir(jobId, res) {
+  rm(jobDir(jobId), { recursive: true, force: true, maxRetries: 8, retryDelay: 500 }).then(
+    () => {
+      if (res.headersSent) return;
+      json(res, 200, { jobId, status: "deleted" });
+    },
+    (err) => {
+      console.error(`[job ${jobId}] purge failed: ${err.message}`);
+      if (res.headersSent) return;
+      json(res, 202, { jobId, status: "deleting", note: "renderer still flushing its files" });
+    },
+  );
+}
+
+async function handleJobOutput(job, res) {
+  if (job.status !== "complete") {
+    return json(res, 409, { error: `job is ${job.status}`, status: job.status });
+  }
+  const { size } = await stat(job.outFile);
+  res.writeHead(200, {
+    "content-type": "video/mp4",
+    "content-length": size,
+    "content-disposition": `attachment; filename="${job.jobId}.mp4"`,
+  });
+  createReadStream(job.outFile).on("error", (err) => res.destroy(err)).pipe(res);
 }
 
 function pump() {
@@ -273,6 +323,17 @@ const server = createServer(async (req, res) => {
       const job = jobs.get(jobMatch[1]);
       if (!job) return json(res, 404, { error: "unknown job" });
       return json(res, 200, publicJob(job));
+    }
+    if (jobMatch && req.method === "DELETE") {
+      const job = jobs.get(jobMatch[1]);
+      if (!job) return json(res, 404, { error: "unknown job" });
+      return await handleDeleteJob(job, res);
+    }
+    const outputMatch = /^\/jobs\/([^/]+)\/output$/.exec(path);
+    if (outputMatch && req.method === "GET") {
+      const job = jobs.get(outputMatch[1]);
+      if (!job) return json(res, 404, { error: "unknown job" });
+      return await handleJobOutput(job, res);
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
