@@ -74,7 +74,7 @@ function jobDir(jobId) {
 async function writeJobFile(job) {
   const target = join(jobDir(job.jobId), "job.json");
   const tmp = `${target}.tmp`;
-  const { compDir, outFile, controller, ...record } = job;
+  const { compDir, outFile, controller, timedOut, cancelRequested, ...record } = job;
   await writeFile(tmp, JSON.stringify(record, null, 2));
   await rename(tmp, target);
 }
@@ -111,6 +111,7 @@ async function recoverJobs() {
     }
     job.status = "failed";
     job.error = "interrupted by a server restart";
+    job.failedStage ??= job.stage ?? "pipeline";
     job.finishedAt = Date.now();
     const revived = rehydrate(job);
     jobs.set(job.jobId, revived);
@@ -148,6 +149,8 @@ function publicJob(job) {
   const pos = positionOf(job.jobId);
   if (pos !== null) view.position = pos;
   if (job.status === "complete") view.download = `/jobs/${job.jobId}/output`;
+  if (job.failedStage) view.failedStage = job.failedStage;
+  if (job.errorDetails) view.errorDetails = job.errorDetails;
   return view;
 }
 
@@ -160,7 +163,12 @@ async function runRender(job) {
   });
 
   const timer =
-    RENDER_TIMEOUT_MS > 0 ? setTimeout(() => job.controller.abort(), RENDER_TIMEOUT_MS) : null;
+    RENDER_TIMEOUT_MS > 0
+      ? setTimeout(() => {
+          job.timedOut = true;
+          job.controller.abort();
+        }, RENDER_TIMEOUT_MS)
+      : null;
 
   try {
     await executeRenderJob(request, job.compDir, job.outFile, (current) => {
@@ -169,6 +177,9 @@ async function runRender(job) {
       if (!TERMINAL.has(current.status)) job.stage = current.currentStage;
       job.totalFrames = current.totalFrames ?? null;
       job.capturedFrames = current.framesRendered ?? null;
+      // Failure diagnostics ride on the job, not the thrown error.
+      if (current.errorDetails) job.errorDetails = current.errorDetails;
+      if (current.failedStage) job.failedStage = current.failedStage;
     }, job.controller.signal);
   } finally {
     if (timer) clearTimeout(timer);
@@ -187,10 +198,20 @@ async function execute(job) {
     job.status = "complete";
     job.progress = 100;
   } catch (err) {
-    if (job.status !== "cancelled") {
+    // A timeout abort and a client DELETE both surface as `cancelled`, so the
+    // abort site sets the flag that tells them apart.
+    if (job.timedOut) {
+      job.status = "failed";
+      job.error = `render exceeded RENDER_TIMEOUT_MS (${RENDER_TIMEOUT_MS})`;
+      console.error(`[job ${job.jobId}] failed\n${job.error}`);
+    } else if (!job.cancelRequested) {
       job.error = err instanceof Error ? err.message : String(err);
       job.status = "failed";
       console.error(`[job ${job.jobId}] failed\n${job.error}`);
+      if (job.failedStage) console.error(`[job ${job.jobId}] failed in stage: ${job.failedStage}`);
+      if (job.errorDetails?.browserConsoleTail) {
+        console.error(`[job ${job.jobId}] browser console tail:\n${job.errorDetails.browserConsoleTail.join("\n")}`);
+      }
     }
   } finally {
     job.controller = null;
@@ -206,6 +227,7 @@ async function handleDeleteJob(job, res) {
   if (idx !== -1) pending.splice(idx, 1);
 
   if (!TERMINAL.has(job.status)) {
+    job.cancelRequested = true;
     job.status = "cancelled";
     job.error = "cancelled by client";
     job.finishedAt = Date.now();
@@ -283,6 +305,10 @@ async function handleCreateJob(req, res) {
     capturedFrames: null,
     size: null,
     error: null,
+    failedStage: null,
+    errorDetails: null,
+    timedOut: false,
+    cancelRequested: false,
     controller: null,
   });
   await writeJobFile(job);

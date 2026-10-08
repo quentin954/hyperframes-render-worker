@@ -132,6 +132,33 @@ Un job :
 `position` n'apparaît que tant que le job attend, `download` que s'il est
 `complete`.
 
+### échec
+
+Un job `failed` expose deux champs en plus, absents des jobs qui n'ont pas
+échoué :
+
+| champ | contenu |
+|---|---|
+| `failedStage` | le stage qui a cassé, ex. `Streaming frame 40000/45000 (4 workers)` |
+| `errorDetails` | diagnostic complet du producer |
+
+`errorDetails` est l'objet que le producteur construit avant de jeter l'erreur :
+`message`, `stack`, `elapsedMs`, `freeMemoryMB`, `browserConsoleTail` (30
+dernières lignes de la console du navigateur), `perfStages` (durée par stage),
+`hdrDiagnostics`, `observability`, `subTimelineWait`. Sans lui, un rendu qui
+plante après 30 minutes ne laisse qu'une phrase ; avec lui on sait quel stage,
+à quelle frame, avec quelles erreurs console.
+
+Le même objet est persisté dans `job.json` sur le volume, donc il survit à un
+redémarrage du serveur.
+
+Deux limites. Le chemin d'annulation (client `DELETE`, ou timeout) n'a pas
+d'`errorDetails` : le producteur throw avant de les construire. Et un timeout
+n'est pas un `DELETE` — le producteur rapporte les deux comme `cancelled`, donc
+le serveur les départage sur le motif de l'abort. Un timeout donne `failed` avec
+`error: render exceeded RENDER_TIMEOUT_MS (<ms>)`, un `DELETE` donne `cancelled`
+avec `error: cancelled by client`.
+
 ### workers
 
 Un rendu mobilise un Chrome par worker. Le nombre se règle par job :
