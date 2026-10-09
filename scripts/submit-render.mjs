@@ -1,7 +1,5 @@
 // Usage: node scripts/submit-render.mjs [compositionDir] [output.mp4] [host] [port]
-// Env:   HF_WORKERS pins the worker count (default: let the renderer decide).
 
-import { env } from "node:process";
 import { describe, download, encodeTree, poll, run, submit, usage, walkComposition } from "./render-client.mjs";
 
 await run(async () => {
@@ -10,8 +8,7 @@ await run(async () => {
   const files = await walkComposition(root);
   console.log(`[render] ${files.length} files in ${root} -> ${host}:${port}`);
 
-  const workers = env.HF_WORKERS ? Number(env.HF_WORKERS) : undefined;
-  const job = await submit(base, await encodeTree(root, files), workers);
+  const job = await submit(base, await encodeTree(root, files));
   console.log(`[render] job ${job.jobId} status=${job.status} workers=${job.workers ?? "auto"}`);
 
   const done = await poll(base, job.jobId, (j) => console.log(describe(j)));

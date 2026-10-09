@@ -1,6 +1,6 @@
 // HTTP render job API.
 // GET  /jobs → 200 json{ count, jobs }
-// POST /jobs  { files: [{ path, content: base64 }], workers? } → 202 json{ job }
+// POST /jobs  { files: [{ path, content: base64 }] } → 202 json{ job }
 // GET  /jobs/:id → 200 json{ job }
 // GET  /jobs/:id/output → 200 video/mp4
 // DELETE /jobs/:id → 200 json{ deleted } | 202 json{ deleting }
@@ -8,6 +8,7 @@
 // GET  /healthz → 200 "ok"
 
 import { createServer } from "node:http";
+import { cpus } from "node:os";
 import { createReadStream } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
@@ -144,10 +145,8 @@ async function recoverJobs() {
   }
 }
 
-function resolveWorkers(value) {
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 1) return null;
-  return Math.min(n, ABSOLUTE_MAX_WORKERS);
+function resolveWorkers() {
+  return Math.min(cpus().length, ABSOLUTE_MAX_WORKERS);
 }
 
 function positionOf(jobId) {
@@ -320,7 +319,7 @@ async function handleCreateJob(req, res) {
   const job = rehydrate({
     jobId,
     status: "queued",
-    workers: resolveWorkers(body.workers),
+    workers: resolveWorkers(),
     createdAt: Date.now(),
     startedAt: null,
     finishedAt: null,

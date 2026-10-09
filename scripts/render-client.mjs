@@ -47,13 +47,11 @@ export async function encodeTree(dir, files) {
   );
 }
 
-export async function submit(base, files, workers) {
-  const body = { files };
-  if (workers !== undefined) body.workers = workers;
+export async function submit(base, files) {
   const res = await req(`${base}/jobs`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ files }),
   });
   const json = await res.json();
   if (!res.ok) throw new Error(`submit failed ${res.status}: ${json.error}`);

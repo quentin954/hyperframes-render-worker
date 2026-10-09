@@ -104,7 +104,7 @@ son propre environnement.
 
 | route | réponse |
 |---|---|
-| `POST /jobs` | `202` job. Corps : `{ files: [{ path, content }], workers? }`, `content` en base64 |
+| `POST /jobs` | `202` job. Corps : `{ files: [{ path, content }] }`, `content` en base64 |
 | `GET /jobs` | `{ count, jobs }`, du plus récent au plus ancien |
 | `GET /jobs/:id` | job |
 | `GET /jobs/:id/output` | `200 video/mp4`, ou `409` tant que le rendu n'est pas terminé |
@@ -166,15 +166,16 @@ avec `error: cancelled by client`.
 
 ### workers
 
-Un rendu mobilise un Chrome par worker. Le nombre se règle par job :
+Un rendu mobilise un Chrome par worker. Le nombre n'est pas réglable : le
+serveur le fixe au nombre de vCPU de la machine, plafonné à 24 (le plafond dur
+du producer). Un job reçoit donc toujours un `workers` non nul, identique au
+nombre de cœurs visibles par le conteneur.
 
-| valeur | effet | `workers` retourné |
-|---|---|---|
-| absente | le producer choisit | `null` |
-| `1` | séquentiel | `1` |
-| `2` à `24` | tel quel, sans calibration | la valeur envoyée |
-| `25` ou plus | borné au plafond | `24` |
-| `0`, `-1`, `2.5`, `"auto"` | invalide, ignoré | `null` |
+Pour rendre avec moins de workers, il faut donner moins de CPU au conteneur :
+
+```bash
+docker run ... --cpuset-cpus="0-3" hf-worker   # 4 workers
+```
 
 ## Côté client
 
@@ -188,7 +189,7 @@ Envoie la composition, puis affiche la progression jusqu'au téléchargement :
 
 ```
 [render] 3 files in cloudflare-intro -> localhost:11111
-[render] job b06a661b-… status=rendering workers=auto
+[render] job b06a661b-… status=rendering workers=8
 [09:44:27] rendering — 60% — 343/540 frames — 15s
 [09:44:42] complete — 100% — 540/540 frames — 23s
 [render] wrote 1118992 bytes to final.mp4
@@ -208,7 +209,6 @@ node scripts/download.mjs <jobId>
 | `HF_TEST_HOST` | hôte, sinon `localhost` |
 | `HF_TEST_PORT` | port, sinon `11111` |
 | `HF_POLL_MS` | intervalle de scrutation, sinon `10000` |
-| `HF_WORKERS` | nombre de workers, sinon automatique |
 
 `scripts/render-client.mjs` regroupe le client HTTP partagé par les trois
 scripts. Les chemins `.*` et les `.mp4` sont ignorés, les sous-dossiers sont
