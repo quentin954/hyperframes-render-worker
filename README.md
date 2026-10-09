@@ -35,8 +35,13 @@ fois le rendu terminé en arrière-plan.
 └───────────────────────────────────────────────┘
          ▲
          │  au démarrage : relit les job.json, recharge la Map,
-         │  et marque failed les jobs trouvés en cours
+         │  et remet en file les jobs trouvés queued ou rendering
 ```
+
+Au redémarrage, un job interrompu n'est pas perdu : il repasse `queued` et
+repart de zéro (le renderer ne reprend pas au milieu), dans son ordre
+d'arrivée d'origine. Un job que le client avait annulé reste `cancelled`, et
+seuls les jobs `complete` restent tels quels.
 
 ## Build
 
@@ -189,7 +194,9 @@ Envoie la composition, puis affiche la progression jusqu'au téléchargement :
 [render] wrote 1118992 bytes to final.mp4
 ```
 
-Un job interrupted n'est pas perdu. Plus tard, depuis n'importe quel terminal :
+Si le conteneur est coupé pendant un rendu (ou pendant qu'un job attendait son
+tour), le job repasse `queued` au redémarrage et repart de zéro tout seul. Pour
+suivre sa nouvelle progression, depuis n'importe quel terminal :
 
 ```bash
 node scripts/status.mjs <jobId>

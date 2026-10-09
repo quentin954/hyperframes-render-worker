@@ -97,6 +97,7 @@ async function recoverJobs() {
     return;
   }
 
+  const requeued = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     let job;
@@ -109,13 +110,37 @@ async function recoverJobs() {
       jobs.set(job.jobId, rehydrate(job));
       continue;
     }
-    job.status = "failed";
-    job.error = "interrupted by a server restart";
-    job.failedStage ??= job.stage ?? "pipeline";
-    job.finishedAt = Date.now();
+    if (job.cancelRequested) {
+      job.status = "cancelled";
+      job.error = "cancelled by client";
+      job.finishedAt ??= Date.now();
+      job.failedStage ??= job.stage ?? "pipeline";
+      const stopped = rehydrate(job);
+      jobs.set(job.jobId, stopped);
+      await writeJobFile(stopped);
+      continue;
+    }
+    job.status = "queued";
+    job.startedAt = null;
+    job.finishedAt = null;
+    job.progress = 0;
+    job.stage = null;
+    job.capturedFrames = null;
+    job.totalFrames = null;
+    job.error = null;
+    job.failedStage = null;
+    job.errorDetails = null;
+    job.timedOut = false;
     const revived = rehydrate(job);
     jobs.set(job.jobId, revived);
     await writeJobFile(revived);
+    requeued.push(revived);
+  }
+  requeued.sort((a, b) => a.createdAt - b.createdAt);
+  for (const job of requeued) pending.push(job.jobId);
+  if (requeued.length > 0) {
+    console.log(`[render-server] requeued ${requeued.length} interrupted job(s)`);
+    requeued.forEach((job) => console.log(`[render-server]   ${job.jobId}`));
   }
 }
 
@@ -407,4 +432,5 @@ const server = createServer(async (req, res) => {
 await recoverJobs();
 server.listen(PORT, () => {
   console.log(`[render-server] listening on :${PORT} data=${join(DATA_DIR, "jobs")}`);
+  pump();
 });
